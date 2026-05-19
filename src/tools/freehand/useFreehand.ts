@@ -107,7 +107,16 @@ export function useFreehand(
     canvas.isDrawingMode = true;
 
     // Tag freshly-created paths with the current operator + phase.
-    // fabric's `path:created` fires once per completed stroke,
+    // fabric's `before:path:created` fires once before stroke is added to the canvas,
+    const onBeforePathCreated = (opt: { path: fabric.Path }) => {
+      const path = opt.path;
+      tagObject(path, operatorRef.current, phaseRef.current);
+      if (spec.markType !== undefined) {
+        tagMarkType(path, spec.markType);
+      }
+    }
+
+    // As opposed to onBeforePathCreated, `path:created` runs
     // AFTER fabric has already emitted `object:added` for the raw
     // path and added it to the canvas. That ordering matters for
     // the arrow postprocess's path→group swap (see design doc
@@ -122,10 +131,6 @@ export function useFreehand(
     // in sync with the finalized stroke.
     const onPathCreated = (opt: { path: fabric.Path }) => {
       const path = opt.path;
-      tagObject(path, operatorRef.current, phaseRef.current);
-      if (spec.markType !== undefined) {
-        tagMarkType(path, spec.markType);
-      }
       if (spec.onPathCreated) {
         spec.onPathCreated(path, {
           canvas,
@@ -135,10 +140,12 @@ export function useFreehand(
         });
       }
     };
+    canvas.on("before:path:created", onBeforePathCreated);
     canvas.on("path:created", onPathCreated);
 
     return () => {
       canvas.isDrawingMode = false;
+      canvas.off("before:path:created", onBeforePathCreated);
       canvas.off("path:created", onPathCreated);
     };
     // `spec` is treated as stable; if the caller swaps the entire
