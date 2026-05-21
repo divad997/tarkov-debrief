@@ -36,6 +36,10 @@ import {
   computeTangent,
   buildArrowhead,
   lastPoint,
+  tangentFromPoints,
+  TANGENT_SAMPLE_COUNT,
+  type Point as ArrowPoint,
+  type Tangent,
 } from "./freehand/arrowhead";
 import { tagObject, tagMarkType, tagArrowTip } from "./metadata";
 import type { Tool, SetToolFn } from "./tool";
@@ -52,6 +56,47 @@ import type { UndoApi } from "./undo";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type FabricPathCommands = readonly any[][];
 
+/**
+ * Compute the tangent at the path's terminus.
+ *
+ * Prefers `path.__rawPoints` — the post-decimation, pre-smoothing
+ * point set the OutlinedPencilBrush stashed on the path when it
+ * was created (see OutlinedBrush.ts `createPath`). Those are the
+ * actual points the user drew.
+ *
+ * Falls back to walking the SVG path commands via `computeTangent`
+ * when `__rawPoints` is missing — e.g., paths constructed in
+ * tests via `new fabric.Path("M …")`, or paths loaded from a
+ * serialized form that doesn't carry `__rawPoints`.
+ *
+ * Why we prefer raw points: fabric's `getSmoothPathFromPoints`
+ * (util/path/index.ts in fabric@7) emits Q commands whose
+ * ENDPOINTS are midpoints between consecutive captured points,
+ * not the captured points themselves. Sampling the SVG endpoints
+ * therefore averages chord directions over a midpoint-polyline,
+ * not the user's actual gesture. Live preview already reads from
+ * `_points` directly (see OutlinedPencilBrush `_renderLiveArrowhead`)
+ * — committing to `__rawPoints` here makes the committed tangent
+ * agree with the live preview's tangent.
+ */
+function pickTangent(
+  path: fabric.Path,
+  commands: FabricPathCommands,
+): Tangent {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = (path as any).__rawPoints as
+    | ReadonlyArray<ArrowPoint>
+    | undefined;
+  if (raw && raw.length >= 2) {
+    // Use the same trailing-window length the SVG-walking path
+    // uses, so behavior is consistent across the two code paths.
+    const tailLen = Math.min(raw.length, TANGENT_SAMPLE_COUNT + 1);
+    return tangentFromPoints(raw.slice(raw.length - tailLen));
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return computeTangent(commands as any);
+}
+
 function appendArrowhead(
   path: fabric.Path,
   ctx: FreehandPostprocessContext,
@@ -63,10 +108,15 @@ function appendArrowhead(
     // than crashing; the raw path stays on the canvas.
     return;
   }
-  const tangent = computeTangent(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    commands as any,
-  );
+  const tangent = pickTangent(path, commands);
+  // Endpoint stays read from the SVG commands (not `__rawPoints`)
+  // so the chevron's tip coincides with the VISIBLE line end. The
+  // last command is a fabric `L` whose endpoint is the final
+  // captured point ± `width/1000` (a tiny correction fabric applies
+  // in `getSmoothPathFromPoints`). Reading from the command keeps
+  // the tip aligned with where the rendered stroke actually ends,
+  // even though the tangent now comes from the un-smoothed point
+  // set above.
   const endpoint = lastPoint(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     commands[commands.length - 1] as any,
