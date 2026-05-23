@@ -289,8 +289,6 @@ export function buildArrowhead(
   strokeWidth: number,
 ): OutlinedPath {
   const [tip, left, right] = arrowheadVertices(endpoint, tangent, strokeWidth);
-  console.log(`left tip arrowhead: (${left.x}, ${left.y})`);
-  console.log(`right tip arrowhead: (${right.x}, ${right.y})`);
   const d =
     `M ${tip.x} ${tip.y} L ${left.x} ${left.y} ` +
     `M ${tip.x} ${tip.y} L ${right.x} ${right.y}`;
