@@ -260,6 +260,7 @@ export class OutlinedPencilBrush extends fabric.PencilBrush {
     // the line.
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.setLineDash([]);
     const drawArms = () => {
       ctx.beginPath();
       ctx.moveTo(tip.x, tip.y);
