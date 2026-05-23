@@ -119,6 +119,53 @@ export class OutlinedPencilBrush extends fabric.PencilBrush {
     return true;
   }
 
+  /**
+   * Pre-decimation snapshot of `_points`, taken at the top of
+   * `_finalizeAndAddPath` and read by `createPath` (which fabric
+   * calls synchronously inside `_finalizeAndAddPath`, AFTER fabric
+   * has already mutated `_points` in place via `decimatePoints`).
+   *
+   * Without this snapshot, the committed arrowhead's tangent walks
+   * a DIFFERENT trailing point set than the live preview:
+   *
+   *  - Live `_renderLiveArrowhead` reads `_points` directly during
+   *    draw, sampling raw captured points.
+   *  - Committed (before snapshot) read `_points` inside `createPath`
+   *    — but `_points` had already been replaced with the decimated
+   *    set, which drops points within `decimate` px of each other
+   *    AND, due to a `for (i = 1; i < l - 1; …)` quirk in fabric's
+   *    `decimatePoints` (see fabric PencilBrush.ts:255), drops the
+   *    second-to-last raw point unconditionally.
+   *
+   * The misalignment is most visible on short gestures with quick
+   * direction changes: decimation removes adjacent points, the
+   * tangent windows diverge, and the chevron rotates between live
+   * and committed.
+   *
+   * Lifecycle: non-null only during the synchronous window between
+   * the snapshot and `super._finalizeAndAddPath` returning. Stored
+   * as plain {x,y}[] (not fabric.Point[]) so the path can carry it
+   * cheaply and so it round-trips through JSON if ever serialized.
+   */
+  private _preDecimationSnapshot:
+    | Array<{ x: number; y: number }>
+    | null = null;
+
+  _finalizeAndAddPath(): void {
+    this._preDecimationSnapshot = this._points.map((p) => ({
+      x: p.x,
+      y: p.y,
+    }));
+    try {
+      super._finalizeAndAddPath();
+    } finally {
+      // Always clear so a future stroke that fails before reaching
+      // createPath (e.g. fabric's empty-SVG short-circuit) can't
+      // poison the next path with stale points.
+      this._preDecimationSnapshot = null;
+    }
+  }
+
   // Two-pass live render. Same shape as OutlinedPath._render —
   // mutate brush properties between super._render calls. The
   // brush's _setBrushStyles reads this.color/width/strokeDashArray
@@ -241,6 +288,29 @@ export class OutlinedPencilBrush extends fabric.PencilBrush {
   // (e.g. adds new stroke properties to copy), this method needs
   // updating too — flagging that here so a future reader knows
   // to diff against fabric's source on upgrades.
+  //
+  // We also stash a plain {x,y}[] snapshot of the captured points
+  // on the path as `__rawPoints`. The arrow tool's appendArrowhead
+  // reads these instead of the SVG path's Q-endpoints, because
+  // fabric's `getSmoothPathFromPoints` writes the MIDPOINT of
+  // consecutive captured points as each Q's endpoint — so walking
+  // SVG endpoints samples a midpoint polyline, not the user's
+  // actual gesture.
+  //
+  // Source preference: `_preDecimationSnapshot` (taken at the top
+  // of `_finalizeAndAddPath`, before fabric's `decimatePoints`
+  // mutates `_points` in place) → falls back to `_points` if the
+  // snapshot is missing (e.g. tests calling createPath directly).
+  // The pre-decimation set is what the live preview's
+  // `_renderLiveArrowhead` also samples; using it here keeps the
+  // committed and live arrowheads aligned at the gesture's
+  // terminus — particularly on short, zig-zagging gestures where
+  // decimation drops nearby points and shifts the trailing chord
+  // directions.
+  //
+  // See src/tools/freehand/arrowhead.ts `computeTangent` and the
+  // `pickTangent` helper in src/tools/arrow.ts for the consumer
+  // side.
   createPath(pathData: AnyOpts): fabric.Path {
     const path = new OutlinedPath(pathData, {
       fill: null,
@@ -257,6 +327,16 @@ export class OutlinedPencilBrush extends fabric.PencilBrush {
       this.shadow.affectStroke = true;
       path.shadow = new fabric.Shadow(this.shadow);
     }
+    // Prefer the pre-decimation snapshot. Fall back to the current
+    // (post-decimation) `_points` only if the snapshot is missing
+    // — e.g. unit tests that call createPath directly without
+    // going through _finalizeAndAddPath. The plain-object copy
+    // in the fallback path avoids retaining fabric.Point method
+    // state on the path.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (path as any).__rawPoints =
+      this._preDecimationSnapshot ??
+      this._points.map((p) => ({ x: p.x, y: p.y }));
     return path;
   }
 }
