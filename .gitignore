@@ -1,7 +1,8 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
-/node_modules
+# Match node_modules at any depth (root + workspace packages like server/)
+node_modules
 /.pnp
 .pnp.js
 
@@ -30,6 +31,13 @@ build/
 
 # Windows download metadata (NTFS alternate data streams)
 *:Zone.Identifier
+
+# SSH keys — should never be in the repo
+sshkey
+sshkey.pub
+*.pem
+id_rsa
+id_ed25519
 
 # playwright
 /test-results/
