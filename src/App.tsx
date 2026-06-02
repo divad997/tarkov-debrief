@@ -75,6 +75,7 @@ import { HotkeysOverlay } from "./components/HotkeysOverlay";
 import { RoomBar } from "./components/RoomBar";
 import { useRoom, getOrCreatePeerId } from "./collab/useRoom";
 import { useRemoteCanvas, isApplyingRemote, EXTRAS } from "./collab/useRemoteCanvas";
+import { GhostCursorLayer } from "./collab/GhostCursorLayer";
 import { isFlagged, REPLAY, TRANSIENT } from "./tools/undo";
 
 const githubUrl = "https://github.com/jrocketfingers/tarkov-debrief";
@@ -303,6 +304,55 @@ function App() {
   // local undo stack. roomOnMessage is stable (useCallback, empty deps).
   // See design_p3_multiplayer.md §7.
   useRemoteCanvas(maybeCanvas, { onMessage: roomOnMessage }, unerasable);
+
+  // P3.3: track the canvas viewport transform in React state so
+  // GhostCursorLayer re-renders correctly after pan/zoom. Must be the full
+  // 6-element affine matrix — a scalar zoom is insufficient once the user
+  // has panned (R8). fabric v7 has no dedicated viewport:transformed event,
+  // so we read canvas.viewportTransform on after:render (fires after every
+  // pan/zoom/draw) and only schedule a React update when the matrix changed.
+  const [viewportTransform, setViewportTransform] = useState<number[]>([1, 0, 0, 1, 0, 0]);
+  useEffect(() => {
+    if (!maybeCanvas) return;
+    const canvas = maybeCanvas;
+    const onRender = () => {
+      const vpt = canvas.viewportTransform;
+      setViewportTransform((prev) => {
+        // Only re-render when the transform actually changed.
+        if (prev.length === vpt.length && prev.every((v, i) => v === vpt[i])) return prev;
+        return [...vpt];
+      });
+    };
+    canvas.on('after:render', onRender);
+    return () => canvas.off('after:render', onRender);
+  }, [maybeCanvas]);
+
+  // P3.3: broadcast local cursor position to peers at ~30 fps. Canvas coords
+  // (pre-viewportTransform) so receivers can apply their own pan/zoom. §9.3
+  const lastCursorSend = useRef(0);
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !maybeCanvas) return;
+    const canvas = maybeCanvas;
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (roomStatus !== 'connected') return;
+      const now = Date.now();
+      if (now - lastCursorSend.current < 33) return; // 30 fps cap
+      lastCursorSend.current = now;
+      // Convert screen coordinates to canvas (scene) coordinates by inverting
+    // the current viewport transform. fabric v7 removed restorePointerVpt;
+    // invertTransform + transformPoint is the v7 equivalent. §9.3
+    const pt = fabric.util.transformPoint(
+        new fabric.Point(e.offsetX, e.offsetY),
+        fabric.util.invertTransform(canvas.viewportTransform),
+      );
+      roomBroadcast({ type: 'cursor', x: pt.x, y: pt.y });
+    };
+
+    container.addEventListener('mousemove', onMouseMove);
+    return () => container.removeEventListener('mousemove', onMouseMove);
+  }, [maybeCanvas, roomStatus, roomBroadcast]);
 
   // P2: replay timeline. Subscribes to object:added/:removed and
   // owns the playhead + speed + play/pause state. Consumed by the
@@ -1241,6 +1291,15 @@ function App() {
             when the timeline is empty. See
             src/components/Scrubber.tsx and design_p2_slice.md §8. */}
         <Scrubber timeline={timeline} />
+        {/* P3.3: ghost cursor overlay. Only rendered when peers are present
+            with cursor positions. pointer-events:none — passes through to
+            canvas. Coordinate conversion uses the full viewportTransform
+            matrix (not just zoom) to handle pan correctly. §9.1 */}
+        <GhostCursorLayer
+          peers={peers}
+          operators={operators}
+          viewportTransform={viewportTransform}
+        />
       </div>
       {radialCenter && (
         <MarkerRadial
