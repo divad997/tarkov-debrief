@@ -102,6 +102,13 @@ export type ClientMessage =
   | ChipClaimMessage
   | ChipReleaseMessage;
 
+// Distributive Omit helper: distributes over union members so each member
+// keeps its own discriminant fields (e.g. 'obj', 'id'). Plain
+// Omit<ClientMessage, 'peerId'> collapses the union and loses type-specific
+// fields. Used as the broadcast() parameter type. §6.2
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+export type BroadcastMessage = DistributiveOmit<ClientMessage, 'peerId'>;
+
 // ---- Server → client -------------------------------------------
 
 export type PeerJoinedMessage = {

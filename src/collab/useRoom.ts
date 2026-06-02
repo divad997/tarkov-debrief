@@ -7,7 +7,7 @@
 // Design reference: claudedocs/design_p3_multiplayer.md §6
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ClientMessage, InboundMessage, PeerInfo } from './protocol';
+import type { BroadcastMessage, ClientMessage, InboundMessage, PeerInfo } from './protocol';
 
 // Dev fallback to ws:// — prod must set VITE_WS_HOST to a wss:// URL because
 // the client is served from HTTPS and browsers block ws:// mixed content. §5.6
@@ -26,6 +26,17 @@ export type UseRoomReturn = {
   peers: PeerInfo[];
   /** Fire-and-forget send. Silently no-ops when disconnected. */
   send: (msg: ClientMessage) => void;
+  /**
+   * Subscribe to all inbound messages. Returns an unsubscribe function.
+   * Handlers are called after useRoom's own peer-list updates complete.
+   * useRemoteCanvas uses this to apply canvas deltas. §7.1
+   */
+  onMessage: (handler: (msg: InboundMessage) => void) => () => void;
+  /**
+   * Convenience broadcast: auto-injects the local peerId.
+   * Silently no-ops when disconnected.
+   */
+  broadcast: (msg: BroadcastMessage) => void;
 };
 
 // Retrieves or generates the local peer ID from sessionStorage. Using
@@ -47,6 +58,11 @@ export function useRoom(
   const [status, setStatus] = useState<RoomStatus>('idle');
   const [peers, setPeers] = useState<PeerInfo[]>([]);
 
+  // External message subscribers (e.g. useRemoteCanvas). Stored in a ref
+  // so handlers registered before/after a reconnect are always in scope
+  // without re-subscribing. The ref outlives effect re-runs. §7.1
+  const messageHandlersRef = useRef<Set<(msg: InboundMessage) => void>>(new Set());
+
   // Stable ref to the live WebSocket so the beforeunload handler and the
   // send callback can reach it without closing over a stale value. §6.3
   const wsRef = useRef<WebSocket | null>(null);
@@ -64,6 +80,22 @@ export function useRoom(
       ws.send(JSON.stringify(msg));
     }
   }, []);
+
+  // Stable subscription function. Empty deps because messageHandlersRef
+  // is a ref — its identity never changes. §6.2
+  const onMessage = useCallback((handler: (msg: InboundMessage) => void): (() => void) => {
+    messageHandlersRef.current.add(handler);
+    return () => messageHandlersRef.current.delete(handler);
+  }, []);
+
+  // Auto-injects peerId so callers can omit it. peerId is stable for the
+  // lifetime of the hook (sessionStorage-backed). §6.2
+  const broadcast = useCallback(
+    (msg: BroadcastMessage) => {
+      send({ ...msg, peerId } as ClientMessage);
+    },
+    [send, peerId],
+  );
 
   useEffect(() => {
     if (!roomId) {
@@ -194,6 +226,10 @@ export function useRoom(
         default:
           break;
       }
+      // Forward every inbound message to external subscribers (e.g.
+      // useRemoteCanvas). Called after the peer-list switch above so
+      // peers state is already updated when the canvas hook sees the msg.
+      messageHandlersRef.current.forEach((h) => h(msg));
     }
 
     connect();
@@ -241,5 +277,5 @@ export function useRoom(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, peerId]);
 
-  return { status, peers, send };
+  return { status, peers, send, onMessage, broadcast };
 }

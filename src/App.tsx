@@ -74,6 +74,8 @@ import {
 import { HotkeysOverlay } from "./components/HotkeysOverlay";
 import { RoomBar } from "./components/RoomBar";
 import { useRoom, getOrCreatePeerId } from "./collab/useRoom";
+import { useRemoteCanvas, isApplyingRemote, EXTRAS } from "./collab/useRemoteCanvas";
+import { isFlagged, REPLAY, TRANSIENT } from "./tools/undo";
 
 const githubUrl = "https://github.com/jrocketfingers/tarkov-debrief";
 
@@ -218,7 +220,17 @@ function App() {
   // peerId is stable per browser tab (sessionStorage). roomId is null when the
   // user is not in a room, or a UUID v4 when connected. See design doc §6.1.
   const [peerId] = useState<string>(getOrCreatePeerId);
-  const [roomId, setRoomId] = useState<string | null>(null);
+
+  // Auto-join: read the room ID from the URL query string on first render so
+  // that pasting a copied link auto-connects without requiring a manual paste
+  // into the RoomBar input. §11.2
+  const [roomId, setRoomId] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const rid = params.get('room');
+    const UUID_V4_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return rid && UUID_V4_RE.test(rid) ? rid : null;
+  });
 
   // useMemo so activeOperator is stable for hooks that depend on it.
   // Declared here (before useRoom) so operatorId can be passed on join.
@@ -226,8 +238,7 @@ function App() {
     () => getActiveOperator(operators, activeOperatorId),
     [operators, activeOperatorId],
   );
-  // send is added in P3.2 when broadcast effects are wired up.
-  const { status: roomStatus, peers } = useRoom(
+  const { status: roomStatus, peers, onMessage: roomOnMessage, broadcast: roomBroadcast } = useRoom(
     roomId,
     peerId,
     activeOperator?.id ?? null,
@@ -236,6 +247,18 @@ function App() {
   const handleRoomChange = useCallback((id: string | null) => {
     setRoomId(id);
   }, []);
+
+  // Keep the URL query string in sync with roomId so the address bar always
+  // holds a copyable link, and so a page reload re-joins the same room. §11.2
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (roomId) {
+      url.searchParams.set('room', roomId);
+    } else {
+      url.searchParams.delete('room');
+    }
+    window.history.replaceState(null, '', url.toString());
+  }, [roomId]);
 
   // Persist on every change. localStorage writes are synchronous in
   // jsdom and fast in browsers; no debounce needed for the change
@@ -275,6 +298,11 @@ function App() {
   // notably useArrow's path→group swap (design doc §5.1 step 8).
   const undoApi = useUndo(maybeCanvas, unerasable);
   const { onUndo } = undoApi;
+
+  // P3.2: apply remote canvas deltas from peers without touching the
+  // local undo stack. roomOnMessage is stable (useCallback, empty deps).
+  // See design_p3_multiplayer.md §7.
+  useRemoteCanvas(maybeCanvas, { onMessage: roomOnMessage }, unerasable);
 
   // P2: replay timeline. Subscribes to object:added/:removed and
   // owns the playhead + speed + play/pause state. Consumed by the
@@ -404,6 +432,8 @@ function App() {
     setSidebar,
     tool,
     setTool,
+    activeOperatorId,
+    phase,
   );
 
   usePan(maybeCanvas, setTool, tool);
@@ -474,6 +504,113 @@ function App() {
       canvas.off("object:removed", recompute);
     };
   }, [maybeCanvas]);
+
+  // === P3.2 — Broadcast local canvas actions to the room ===
+  //
+  // Named handler refs (const onAdd = ...) are REQUIRED here — see
+  // design_p3_multiplayer.md §7.6 (R15, Check B): canvas.off(event, fn)
+  // needs the exact same function reference. Anonymous lambdas passed to
+  // canvas.off without a reference would remove ALL handlers for the
+  // event, including useUndo's listeners.
+  useEffect(() => {
+    if (!maybeCanvas || !roomId) return;
+    const canvas = maybeCanvas;
+
+    const onAdd = ({ target }: { target: fabric.FabricObject }) => {
+      // Skip remote-applied objects (would echo them back to the room). §7.1
+      if (isApplyingRemote()) return;
+      // Skip undo-replay and transient preview objects. §7.6
+      if (isFlagged(target, REPLAY) || isFlagged(target, TRANSIENT)) return;
+      // Map image and other untagged objects have no __id; don't broadcast.
+      const id = readId(target);
+      if (!id) return;
+      roomBroadcast({
+        type: 'delta:added',
+        // toObject cast: EXTRAS contains custom __-prefixed props outside
+        // fabric's strict type — same pattern as tagObject in metadata.ts.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        obj: (target as any).toObject(EXTRAS),
+      });
+    };
+
+    const onModified = ({ target }: { target: fabric.FabricObject }) => {
+      if (isApplyingRemote()) return;
+      if (isFlagged(target, REPLAY) || isFlagged(target, TRANSIENT)) return;
+
+      // Multi-selection: fabric fires object:modified on an ActiveSelection
+      // (a transient group with no __id). Broadcast each child's absolute
+      // transform by composing the group matrix with the child's own matrix.
+      // child.calcTransformMatrix() already returns the absolute canvas
+      // transform when the child has a group parent. §7.6
+      if (target instanceof fabric.ActiveSelection) {
+        const now = Date.now();
+        for (const child of target.getObjects()) {
+          const childId = readId(child as fabric.FabricObject);
+          if (!childId) continue;
+          if (isFlagged(child as fabric.FabricObject, TRANSIENT)) continue;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (child as any).__lastModifiedTs = now;
+          const { translateX: left, translateY: top, scaleX, scaleY, angle } =
+            fabric.util.qrDecompose((child as fabric.FabricObject).calcTransformMatrix());
+          roomBroadcast({
+            type: 'delta:modified',
+            id: childId,
+            isGroup: child instanceof fabric.Group,
+            patch: child instanceof fabric.Group
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              ? (child as any).toObject(EXTRAS)
+              : { left, top, scaleX, scaleY, angle },
+          });
+        }
+        return;
+      }
+
+      const id = readId(target);
+      if (!id) return;
+      const isGroup = target instanceof fabric.Group;
+      // Record local modification time for client-side conflict resolution
+      // when receiving delta:modified from other peers. §7.4
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (target as any).__lastModifiedTs = Date.now();
+      roomBroadcast({
+        type: 'delta:modified',
+        id,
+        isGroup,
+        // Groups need full re-serialization (internal geometry may change).
+        // Plain objects send only transform props to keep frames small. §4.2
+        patch: isGroup
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ? (target as any).toObject(EXTRAS)
+          : {
+              left: target.left,
+              top: target.top,
+              scaleX: target.scaleX,
+              scaleY: target.scaleY,
+              angle: target.angle,
+            },
+      });
+    };
+
+    const onRemoved = ({ target }: { target: fabric.FabricObject }) => {
+      if (isApplyingRemote()) return;
+      // Skip undo replays that remove objects as part of an undo "add".
+      if (isFlagged(target, REPLAY)) return;
+      if (isFlagged(target, TRANSIENT)) return;
+      const id = readId(target);
+      if (!id) return; // map image and untagged objects
+      roomBroadcast({ type: 'delta:removed', id });
+    };
+
+    canvas.on('object:added', onAdd);
+    canvas.on('object:modified', onModified);
+    canvas.on('object:removed', onRemoved);
+
+    return () => {
+      canvas.off('object:added', onAdd);
+      canvas.off('object:modified', onModified);
+      canvas.off('object:removed', onRemoved);
+    };
+  }, [maybeCanvas, roomId, roomBroadcast]);
 
   // === Brush color follows active operator ===
   //

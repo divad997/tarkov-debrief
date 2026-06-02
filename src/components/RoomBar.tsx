@@ -6,7 +6,7 @@
 //
 // Design reference: claudedocs/design_p3_multiplayer.md §9.2
 
-import React, { useCallback, useRef } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import type { RoomStatus } from '../collab/useRoom';
 import './RoomBar.css';
 
@@ -26,6 +26,8 @@ const STATUS_LABELS: Record<RoomStatus, string> = {
 
 export function RoomBar({ roomId, status, peerCount, onChange }: RoomBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  // "Copied!" flash state for the copy button.
+  const [copied, setCopied] = useState(false);
 
   const handleNew = useCallback(() => {
     const id = crypto.randomUUID();
@@ -54,13 +56,31 @@ export function RoomBar({ roomId, status, peerCount, onChange }: RoomBarProps) {
 
   const handleCopy = useCallback(() => {
     if (!roomId) return;
-    // Build a shareable URL by appending the room ID as a query param to the
-    // current hash URL. The receiver pastes the room ID from the URL into their
-    // RoomBar. Full URL-based auto-join is a P3.N concern.
-    const url = `${window.location.href.split('?')[0]}?room=${roomId}`;
-    navigator.clipboard.writeText(url).catch(() => {
-      // Clipboard API requires user gesture in some browsers; fall back to
-      // showing the ID in the input so the user can copy it manually.
+    // App.tsx keeps window.location.href in sync with roomId (replaceState),
+    // so the current href already contains ?room=<uuid> plus the hash path of
+    // the current map. Copying it gives the recipient a link that lands on the
+    // right map AND auto-joins the room. §11.2
+    const url = window.location.href;
+
+    const execCopy = () => {
+      const el = document.createElement('textarea');
+      el.value = url;
+      el.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      try { document.execCommand('copy'); } catch { /* best-effort */ }
+      document.body.removeChild(el);
+    };
+
+    navigator.clipboard.writeText(url).then(() => {
+      execCopy();
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {
+      execCopy();
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     });
   }, [roomId]);
 
@@ -86,7 +106,7 @@ export function RoomBar({ roomId, status, peerCount, onChange }: RoomBarProps) {
       ) : (
         <>
           <button className="RoomBar-btn" onClick={handleCopy} title="Copy shareable link">
-            Copy link
+            {copied ? 'Copied!' : 'Copy link'}
           </button>
           <button className="RoomBar-btn RoomBar-btn--leave" onClick={handleLeave} title="Leave room">
             Leave
