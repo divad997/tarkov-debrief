@@ -72,6 +72,8 @@ import {
   type MarkerOption,
 } from "./components/MarkerRadial";
 import { HotkeysOverlay } from "./components/HotkeysOverlay";
+import { RoomBar } from "./components/RoomBar";
+import { useRoom, getOrCreatePeerId } from "./collab/useRoom";
 
 const githubUrl = "https://github.com/jrocketfingers/tarkov-debrief";
 
@@ -211,6 +213,30 @@ function App() {
   );
   const [phase, setPhase] = useState<Phase>(() => loadPhase());
 
+  // === P3 multiplayer room state ===
+  //
+  // peerId is stable per browser tab (sessionStorage). roomId is null when the
+  // user is not in a room, or a UUID v4 when connected. See design doc §6.1.
+  const [peerId] = useState<string>(getOrCreatePeerId);
+  const [roomId, setRoomId] = useState<string | null>(null);
+
+  // useMemo so activeOperator is stable for hooks that depend on it.
+  // Declared here (before useRoom) so operatorId can be passed on join.
+  const activeOperator = useMemo(
+    () => getActiveOperator(operators, activeOperatorId),
+    [operators, activeOperatorId],
+  );
+  // send is added in P3.2 when broadcast effects are wired up.
+  const { status: roomStatus, peers } = useRoom(
+    roomId,
+    peerId,
+    activeOperator?.id ?? null,
+  );
+
+  const handleRoomChange = useCallback((id: string | null) => {
+    setRoomId(id);
+  }, []);
+
   // Persist on every change. localStorage writes are synchronous in
   // jsdom and fast in browsers; no debounce needed for the change
   // volumes this UI produces.
@@ -236,11 +262,6 @@ function App() {
     if (isTransientTool(tool.type)) return;
     saveTool(tool.type);
   }, [tool.type]);
-
-  const activeOperator = useMemo(
-    () => getActiveOperator(operators, activeOperatorId),
-    [operators, activeOperatorId],
-  );
 
   const save = () => {
     if (maybeCanvas) {
@@ -1051,6 +1072,15 @@ function App() {
           </button>
         </section>
       </header>
+      {/* P3 room status bar. Sits between header and canvas so it doesn't
+          disrupt the existing header layout. Hidden when not in use via the
+          compact single-row height. See design_p3_multiplayer.md §9.2. */}
+      <RoomBar
+        roomId={roomId}
+        status={roomStatus}
+        peerCount={peers.length + 1}
+        onChange={handleRoomChange}
+      />
       {/* Sidebar stays as a stub for the color picker only — the
           marker section moved to the radial below. Full removal
           of the sidebar (and the react-color dep) is tech debt
