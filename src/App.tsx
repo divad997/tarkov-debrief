@@ -76,6 +76,7 @@ import { RoomBar } from "./components/RoomBar";
 import { useRoom, getOrCreatePeerId } from "./collab/useRoom";
 import { useRemoteCanvas, isApplyingRemote, EXTRAS } from "./collab/useRemoteCanvas";
 import { GhostCursorLayer } from "./collab/GhostCursorLayer";
+import { usePartialPath } from "./collab/usePartialPath";
 import { isFlagged, REPLAY, TRANSIENT } from "./tools/undo";
 
 const githubUrl = "https://github.com/jrocketfingers/tarkov-debrief";
@@ -304,6 +305,18 @@ function App() {
   // local undo stack. roomOnMessage is stable (useCallback, empty deps).
   // See design_p3_multiplayer.md §7.
   useRemoteCanvas(maybeCanvas, { onMessage: roomOnMessage }, unerasable);
+
+  // P3.4: broadcast in-progress freehand strokes as partial-path frames so
+  // remote peers see a live ghost while the user draws. See §8.
+  usePartialPath(
+    maybeCanvas,
+    roomOnMessage,
+    roomBroadcast,
+    roomStatus,
+    operators,
+    activeOperatorId,
+    phase,
+  );
 
   // P3.3: track the canvas viewport transform in React state so
   // GhostCursorLayer re-renders correctly after pan/zoom. Must be the full
