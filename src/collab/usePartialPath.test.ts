@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 // Tests for usePartialPath — partial-path streaming (P3.4).
 //
 // Covers: sending side (path:stroke, path:commit broadcast), receiving side

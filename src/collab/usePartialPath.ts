@@ -250,6 +250,5 @@ export function usePartialPath(
     };
   // broadcast is stable via useCallback; onRoomMessage is stable (empty deps).
   // Remaining deps are ref-mirrored so we never re-register the handlers.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvas, onRoomMessage]);
 }

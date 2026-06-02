@@ -250,6 +250,84 @@ function App() {
     setRoomId(id);
   }, []);
 
+  // P3.5: join-flow toast — "You're drawing as Alpha — tap a chip to change."
+  // Auto-dismisses after 3 s. §11.2
+  const [joinToastName, setJoinToastName] = useState<string | null>(null);
+  const joinToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!joinToastName) return;
+    if (joinToastTimerRef.current) clearTimeout(joinToastTimerRef.current);
+    joinToastTimerRef.current = setTimeout(() => setJoinToastName(null), 3000);
+    return () => {
+      if (joinToastTimerRef.current) clearTimeout(joinToastTimerRef.current);
+    };
+  }, [joinToastName]);
+
+  // Ref-mirrors for claim-on-join effect so it reads current state without
+  // re-running when those values change (only roomStatus is the trigger). §10.1
+  const operatorsRefP35 = useRef(operators);
+  operatorsRefP35.current = operators;
+  const activeOperatorIdRef = useRef(activeOperatorId);
+  activeOperatorIdRef.current = activeOperatorId;
+
+  // P3.5: claim-on-join — when the room transitions to connected, re-claim an
+  // existing chip immediately, or auto-assign the first unclaimed one. §10.1
+  //
+  // For users with no saved chip, we subscribe to the snapshot message and read
+  // msg.peers directly rather than relying on React state (peersRef). The
+  // snapshot arrives in a separate WebSocket message event from the 'open'
+  // event that triggers roomStatus='connected', so React may not have committed
+  // setPeers(snapshot.peers) yet when this effect fires. Reading the peers list
+  // from the snapshot message itself avoids that race. §10.1
+  useEffect(() => {
+    if (roomStatus !== 'connected') return;
+
+    const currentId = activeOperatorIdRef.current;
+    if (currentId) {
+      // Already have a chip (from localStorage or previous session) — re-claim
+      // it so other peers see the badge. chip-change effect won't fire because
+      // activeOperatorId didn't change.
+      roomBroadcast({ type: 'chip:claim', operatorId: currentId });
+      setJoinToastName(
+        operatorsRefP35.current.find((op) => op.id === currentId)?.name ?? null,
+      );
+      return;
+    }
+
+    // No saved chip — wait for the snapshot to know which chips are already
+    // taken before assigning. roomOnMessage is stable (empty-deps useCallback).
+    const unsub = roomOnMessage((msg) => {
+      if (msg.type !== 'snapshot') return;
+      // Guard: user may have manually picked a chip while waiting.
+      if (activeOperatorIdRef.current) return;
+      const claimedIds = new Set(
+        msg.peers.map((p) => p.operatorId).filter(Boolean),
+      );
+      const unclaimed = operatorsRefP35.current.find((op) => !claimedIds.has(op.id));
+      if (unclaimed) {
+        setActiveOperatorId(unclaimed.id);
+        setJoinToastName(unclaimed.name);
+        // chip:claim is broadcast by the chip-change effect after the state
+        // update triggers a re-render (activeOperatorId null → unclaimed.id).
+      }
+    });
+    return unsub;
+  }, [roomStatus, roomOnMessage, roomBroadcast]);
+
+  // P3.5: broadcast chip:release + chip:claim whenever the user changes their
+  // active operator while connected. Prev-value tracking via ref ensures we
+  // always know what to release. §10.1
+  const prevActiveOperatorIdRef = useRef<OperatorId | null>(null);
+  useEffect(() => {
+    const prev = prevActiveOperatorIdRef.current;
+    prevActiveOperatorIdRef.current = activeOperatorId;
+
+    if (roomStatus !== 'connected') return;
+    if (prev === activeOperatorId) return; // no change
+    if (prev !== null) roomBroadcast({ type: 'chip:release', operatorId: prev });
+    if (activeOperatorId !== null) roomBroadcast({ type: 'chip:claim', operatorId: activeOperatorId });
+  }, [activeOperatorId, roomStatus, roomBroadcast]);
+
   // Keep the URL query string in sync with roomId so the address bar always
   // holds a copyable link, and so a page reload re-joins the same room. §11.2
   useEffect(() => {
@@ -1238,6 +1316,7 @@ function App() {
             activeId={activeOperatorId}
             onClick={onOperatorClick}
             onShiftClick={onOperatorShiftClick}
+            peers={peers}
           />
           <PhaseToggle phase={phase} onChange={setPhase} />
         </section>
@@ -1313,6 +1392,13 @@ function App() {
           operators={operators}
           viewportTransform={viewportTransform}
         />
+        {/* P3.5: join-flow toast. Appears once on room join, auto-dismisses
+            after 3 s. pointer-events:none so it doesn't block canvas input. §11.2 */}
+        {joinToastName && (
+          <div className="JoinToast" role="status" aria-live="polite">
+            You&apos;re drawing as {joinToastName} — tap a chip to change.
+          </div>
+        )}
       </div>
       {radialCenter && (
         <MarkerRadial

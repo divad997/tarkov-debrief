@@ -145,7 +145,13 @@ export function useRoom(
       });
 
       ws.addEventListener('close', (event) => {
-        wsRef.current = null;
+        // Guard: only null the ref if this socket is still the current one.
+        // Without this, React Strict Mode's double-invocation creates ws_1,
+        // immediately closes it, creates ws_2, then ws_1's async close event
+        // stomps wsRef.current back to null — silently dropping all sends
+        // from ws_2. Strict Mode only doubles the initial mount, so manual-
+        // paste (a deps-change re-run) is unaffected. §6.3
+        if (wsRef.current === ws) wsRef.current = null;
         if (!active) return;
         if (intentionalCloseRef.current) return;
 
