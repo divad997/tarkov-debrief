@@ -4,22 +4,29 @@
 // The user can type or paste a UUID to join a room; "New" generates a fresh
 // one; "Copy link" writes a shareable URL to the clipboard.
 //
-// Design reference: claudedocs/design_p3_multiplayer.md §9.2
+// Design reference: claudedocs/design_p3_multiplayer_p2p.md §9
 
 import React, { useCallback, useRef, useState } from 'react';
-import type { RoomStatus } from '../collab/useRoom';
 import './RoomBar.css';
 
 interface RoomBarProps {
   roomId: string | null;
-  status: RoomStatus;
+  // Accepts string (not the relay RoomStatus union) so both the relay and P2P
+  // room hooks can pass their status without a shared type dependency. The
+  // CSS class and label record handle any unknown status gracefully. §11.1
+  status: string;
   peerCount: number;
   onChange: (roomId: string | null) => void;
 }
 
-const STATUS_LABELS: Record<RoomStatus, string> = {
+const STATUS_LABELS: Record<string, string> = {
+  // Relay statuses
   idle: 'offline',
+  // P2P statuses (disconnected replaces idle)
+  disconnected: 'offline',
   connecting: 'connecting…',
+  reconnecting: 'reconnecting…',
+  'awaiting-snapshot': '◑ receiving…',
   connected: 'live',
   error: 'error',
 };
@@ -41,15 +48,19 @@ export function RoomBar({ roomId, status, peerCount, onChange }: RoomBarProps) {
   const handleInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const val = e.target.value.trim();
-      // Only accept when value looks like a UUID — prevents typo-driven
-      // partial connections. The user must paste or type a full UUID.
       const UUID_V4_RE =
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
       if (UUID_V4_RE.test(val)) {
         onChange(val);
-      } else if (val === '') {
-        onChange(null);
+        return;
       }
+      // Also accept a full URL with ?room=<uuid> so pasting the "Copy link"
+      // output directly into the input field works.
+      try {
+        const rid = new URL(val).searchParams.get('room');
+        if (rid && UUID_V4_RE.test(rid)) { onChange(rid); return; }
+      } catch { /* not a URL */ }
+      if (val === '') onChange(null);
     },
     [onChange],
   );
@@ -116,9 +127,9 @@ export function RoomBar({ roomId, status, peerCount, onChange }: RoomBarProps) {
       <span
         className={`RoomBar-status RoomBar-status--${status}`}
         aria-live="polite"
-        aria-label={`Connection status: ${STATUS_LABELS[status]}`}
+        aria-label={`Connection status: ${STATUS_LABELS[status] ?? status}`}
       >
-        {STATUS_LABELS[status]}
+        {STATUS_LABELS[status] ?? status}
       </span>
       {status === 'connected' && (
         <span className="RoomBar-peers" aria-label={`${peerCount} peer${peerCount !== 1 ? 's' : ''} connected`}>

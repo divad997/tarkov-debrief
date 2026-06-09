@@ -22,7 +22,6 @@ import * as fabric from 'fabric';
 import { useEffect, useRef } from 'react';
 import { setApplyingRemote } from './remoteFlag';
 import type { BroadcastMessage, InboundMessage } from './protocol';
-import type { RoomStatus } from './useRoom';
 import type { Operator } from '../state/operators';
 import type { OperatorId } from '../state/operators';
 import type { Phase } from '../state/phase';
@@ -88,7 +87,9 @@ export function usePartialPath(
   canvas: fabric.Canvas | null,
   onRoomMessage: (handler: (msg: InboundMessage) => void) => () => void,
   broadcast: (msg: BroadcastMessage) => void,
-  roomStatus: RoomStatus,
+  // Accepts string (not the relay RoomStatus union) so both the relay and P2P
+  // hooks can pass their status. The only check is === 'connected'. §6.1
+  roomStatus: string,
   operators: Operator[],
   activeOperatorId: OperatorId | null,
   phase: Phase,

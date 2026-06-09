@@ -108,9 +108,28 @@
   border-color: #4a8c4a;
 }
 
+.RoomBar-status--reconnecting {
+  color: #9a8866;
+  border-color: #9a8866;
+  animation: RoomBar-pulse 1.2s ease-in-out infinite;
+}
+
+/* awaiting-snapshot: blue pulse while receiving canvas from eldest peer. §11.1 */
+.RoomBar-status--awaiting-snapshot {
+  color: #4a6a8c;
+  border-color: #4a6a8c;
+  animation: RoomBar-pulse 1.2s ease-in-out infinite;
+}
+
 .RoomBar-status--error {
   color: #8c4a4a;
   border-color: #8c4a4a;
+}
+
+/* P2P: disconnected is same as idle (offline) */
+.RoomBar-status--disconnected {
+  color: #5c513d;
+  border-color: #5c513d;
 }
 
 @keyframes RoomBar-pulse {

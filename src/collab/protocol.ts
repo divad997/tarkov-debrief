@@ -1,10 +1,9 @@
-// Shared WebSocket message types for P3 multiplayer co-editing.
+// Shared message types for P3 multiplayer co-editing.
 //
-// Discriminated union on `type` so both client and server can
-// switch on it exhaustively. Contains only types — no runtime
-// logic — so it can be imported by either environment safely.
+// Discriminated union on `type`. Contains only types — no runtime
+// logic — so it can be imported safely from any module.
 //
-// Design reference: claudedocs/design_p3_multiplayer.md §4.2
+// Design reference: claudedocs/design_p3_multiplayer_p2p.md §4
 
 // Serialized fabric object including custom property extras
 // (__id, __operatorId, __phase, __seq, __markType, __arrowTip).

@@ -73,7 +73,7 @@ import {
 } from "./components/MarkerRadial";
 import { HotkeysOverlay } from "./components/HotkeysOverlay";
 import { RoomBar } from "./components/RoomBar";
-import { useRoom, getOrCreatePeerId } from "./collab/useRoom";
+import { getOrCreatePeerId, usePeerRoom } from "./collab/usePeerRoom";
 import { useRemoteCanvas, isApplyingRemote, EXTRAS } from "./collab/useRemoteCanvas";
 import { GhostCursorLayer } from "./collab/GhostCursorLayer";
 import { usePartialPath } from "./collab/usePartialPath";
@@ -240,11 +240,19 @@ function App() {
     () => getActiveOperator(operators, activeOperatorId),
     [operators, activeOperatorId],
   );
-  const { status: roomStatus, peers, onMessage: roomOnMessage, broadcast: roomBroadcast } = useRoom(
-    roomId,
-    peerId,
-    activeOperator?.id ?? null,
-  );
+  // usePeerRoom replaces useRoom for the P2P variant. Canvas is needed so the
+  // eldest peer can serialize it for snapshot requests. §6.2
+  const roomRoom = usePeerRoom(roomId, peerId, activeOperator?.id ?? null, maybeCanvas);
+  const roomStatus = roomRoom.state.status;
+  // Flatten Map → PeerInfo[] for GhostCursorLayer and peerCount display.
+  const peers = roomRoom.state.status === 'connected'
+    ? Array.from(roomRoom.state.peers.values())
+    : [];
+  const roomOnMessage = roomRoom.onMessage;
+  const roomBroadcast = roomRoom.broadcast;
+  // stateRef for chip-claim: read peers at effect-fire time without subscribing
+  // to a snapshot InboundMessage (P2P has no relay-style snapshot message). §10.1
+  const roomStateRef = roomRoom.stateRef;
 
   const handleRoomChange = useCallback((id: string | null) => {
     setRoomId(id);
@@ -273,12 +281,11 @@ function App() {
   // P3.5: claim-on-join — when the room transitions to connected, re-claim an
   // existing chip immediately, or auto-assign the first unclaimed one. §10.1
   //
-  // For users with no saved chip, we subscribe to the snapshot message and read
-  // msg.peers directly rather than relying on React state (peersRef). The
-  // snapshot arrives in a separate WebSocket message event from the 'open'
-  // event that triggers roomStatus='connected', so React may not have committed
-  // setPeers(snapshot.peers) yet when this effect fires. Reading the peers list
-  // from the snapshot message itself avoids that race. §10.1
+  // P2P: unlike the relay variant, 'connected' fires AFTER the snapshot has been
+  // applied and peerInfo is fully populated. We read claimed chips directly from
+  // roomStateRef (instead of subscribing to a snapshot InboundMessage which P2P
+  // doesn't emit). React has committed the connected state before effects run, so
+  // roomStateRef.current reflects the current peers at effect-fire time. §10.1
   useEffect(() => {
     if (roomStatus !== 'connected') return;
 
@@ -294,25 +301,25 @@ function App() {
       return;
     }
 
-    // No saved chip — wait for the snapshot to know which chips are already
-    // taken before assigning. roomOnMessage is stable (empty-deps useCallback).
-    const unsub = roomOnMessage((msg) => {
-      if (msg.type !== 'snapshot') return;
-      // Guard: user may have manually picked a chip while waiting.
-      if (activeOperatorIdRef.current) return;
-      const claimedIds = new Set(
-        msg.peers.map((p) => p.operatorId).filter(Boolean),
-      );
-      const unclaimed = operatorsRefP35.current.find((op) => !claimedIds.has(op.id));
-      if (unclaimed) {
-        setActiveOperatorId(unclaimed.id);
-        setJoinToastName(unclaimed.name);
-        // chip:claim is broadcast by the chip-change effect after the state
-        // update triggers a re-render (activeOperatorId null → unclaimed.id).
-      }
-    });
-    return unsub;
-  }, [roomStatus, roomOnMessage, roomBroadcast]);
+    // No saved chip — read which chips are claimed from the current room state.
+    // roomStateRef is stable and its .current reflects the just-committed state.
+    const st = roomStateRef.current;
+    // stateRef.current is RefObject<T>.current which TypeScript types as T|null,
+    // though in practice it's always initialized before this effect runs.
+    if (!st || st.status !== 'connected') return;
+    const claimedIds = new Set(
+      Array.from(st.peers.values()).map((p) => p.operatorId).filter(Boolean),
+    );
+    const unclaimed = operatorsRefP35.current.find((op) => !claimedIds.has(op.id));
+    if (unclaimed) {
+      setActiveOperatorId(unclaimed.id);
+      setJoinToastName(unclaimed.name);
+      // chip:claim is broadcast by the chip-change effect after the state
+      // update triggers a re-render (activeOperatorId null → unclaimed.id).
+    }
+  // roomStateRef is a stable ref — identity never changes, not a dep.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomStatus, roomBroadcast]);
 
   // P3.5: broadcast chip:release + chip:claim whenever the user changes their
   // active operator while connected. Prev-value tracking via ref ensures we

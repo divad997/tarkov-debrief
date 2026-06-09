@@ -28,13 +28,9 @@ jobs:
 
       - run: pnpm typecheck
 
-      - run: pnpm --filter debrief-server typecheck
-
       - run: pnpm lint
 
       - run: pnpm test
-
-      - run: pnpm --filter debrief-server test
 
       - run: pnpm exec playwright install --with-deps chromium
 
