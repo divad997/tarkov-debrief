@@ -833,28 +833,76 @@ const onModified = ({ target }) => {
 
 ## 8. Partial-Path Streaming (`usePartialPath`)
 
-**Identical to relay variant §8** in logic and code shape. The only
-difference: `path:stroke` and `path:commit` travel over the
-`ephemeral` DataChannel (unordered, no retransmit) rather than the
-signaling WebSocket. Frame loss in the ephemeral channel is
-acceptable — a dropped stroke-update shows as a momentary stall in
-the ghost path, not an inconsistency.
+`path:stroke` and `path:commit` travel over the `ephemeral` DataChannel
+(unordered, no retransmit) rather than the signaling WebSocket. Frame loss
+is acceptable — a dropped stroke-update shows as a momentary stall in the
+ghost path, not an inconsistency.
 
-The `withRemote` wrapping, `__peerId`/`__ghostId` on ghost paths,
-and `peer:left` cleanup (§8.4 of relay doc) are all unchanged.
+The `withRemote` wrapping, `__peerId`/`__ghostId` on ghost paths, and
+`peer:left` cleanup (§8.4 of relay doc) are all unchanged.
 
-> **Verify before coding P3.4 — Check C and Check D from relay
-> variant §8 apply here identically.** Spike the `fabric.Polyline`
-> live-update path and confirm `PencilBrush._points` field name
-> before coding.
+### 8.1 Bandwidth-optimized sending (implemented)
+
+The sender sends **delta-only** points each frame rather than the full
+growing array, and throttles at **~30 fps** (33 ms) instead of 60 fps.
+Coordinate values are rounded to 1 decimal place before serializing.
+
+```ts
+// Sender tracks lastSentCount per stroke; resets on mouse:down.
+const newPts = pts.slice(lastSentCount);
+if (newPts.length === 0) return;
+lastSentCount = pts.length;
+
+broadcast({
+  type: 'path:stroke',
+  id: activePathId.current,
+  points: newPts.flatMap(p => [
+    Math.round(p.x * 10) / 10,
+    Math.round(p.y * 10) / 10,
+  ]),
+  ...
+});
+```
+
+The `path:stroke` wire format (`points: number[]`) is unchanged — receivers
+that accumulate correctly do not need a protocol version bump.
+
+### 8.2 Receiver accumulation
+
+Because the sender now sends deltas, the receiver maintains a
+`strokePoints: Map<strokeId, fabric.Point[]>` accumulator alongside the
+existing `ghostPaths` registry. Each incoming `path:stroke` appends its
+new points to the accumulator; the ghost Polyline is rebuilt from the full
+accumulated array. Both `path:commit` and `peer:left` clear the accumulator
+entry alongside the ghost registry entry.
+
+### 8.3 Impact
+
+A 3-second stroke at typical drawing speed generates ~300 brush points.
+- **Before:** last frame sends all 300 points (~600 bytes/frame at 60 fps)
+- **After:** each frame sends only the ~5 new points since the last frame
+  (~30 bytes/frame at 30 fps)
+- Combined reduction: **~95% less path:stroke traffic**
+
+> **Check C and Check D from relay variant §8 apply here identically.**
+> Spike the `fabric.Polyline` live-update path and confirm
+> `PencilBrush._points` field name before coding.
 
 ---
 
 ## 9. Ghost Cursors
 
-**Identical to relay variant §9** — HTML overlay, `viewportTransform`
-prop, 30 fps broadcast throttle, 2 s fade. Cursor messages go over
-the `ephemeral` channel. No changes needed.
+HTML overlay, `viewportTransform` prop, 30 fps broadcast throttle, 2 s fade.
+Cursor messages go over the `ephemeral` channel.
+
+Two bandwidth micro-optimizations are applied on top of the relay variant design:
+
+- **Dead-zone guard** — cursor send is skipped if the canvas-space position
+  hasn't changed by more than 2 px in either axis since the last broadcast.
+  This eliminates traffic when the mouse is stationary or nearly so (hovering,
+  reading the map) while the mousemove events still fire at high frequency.
+- **Coordinate rounding** — `x` and `y` are rounded to 1 decimal place before
+  broadcasting. Sub-pixel precision is unnecessary for ghost cursor rendering.
 
 ---
 
@@ -999,7 +1047,7 @@ Identical to relay variant P3.5.
 | R6-P2P | Snapshot chunk arrives out of order on DataChannel | Low | Reliable DataChannel is ordered; chunks always arrive in send order. The `index` field is defensive, not load-bearing. |
 | R7-P2P | Canvas snapshot too large to transfer in DataChannel frames | Med | Chunk at 60 KB; accumulate on receiver. Chrome DataChannel max message is 256 KB; chunking provides 4× headroom. |
 | R8-P2P | Multiple peers simultaneously try to send snapshot to same new joiner | Low | Not possible. DataChannels are point-to-point pipes — `snapshot:request` is sent only on the DataChannel to the eldest peer; other peers' channels never receive it. |
-| R9-P2P | Ephemeral DataChannel frame loss causes ghost path to freeze mid-draw | Low | Acceptable — ghost path stalls for one dropped frame interval (~16 ms), then resumes. No consistency impact. |
+| R9-P2P | Ephemeral DataChannel frame loss causes ghost path to freeze mid-draw | Low | Acceptable — ghost path stalls for one dropped frame interval (~33 ms at 30 fps), then resumes. No consistency impact. |
 | R10-P2P | `RTCPeerConnection` not garbage-collected after close | Med | Explicitly call `rtc.close()` on every `RTCPeerConnection` in cleanup (and `dc.close()` on each DataChannel first); verify in `usePeerRoom.test.ts` that no connections remain open on unmount |
 | R11-P2P | Signaling WebSocket blocked by mixed-content policy | Med | Client is served over HTTPS (`debrief.jrkt.dev`); browsers block `ws://` from HTTPS pages. `VITE_SIGNAL_HOST` must use `wss://` in production. WebRTC DataChannels themselves are peer-to-peer and unaffected by mixed-content rules. |
 
