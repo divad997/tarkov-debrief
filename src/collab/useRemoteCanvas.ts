@@ -82,17 +82,49 @@ export function useRemoteCanvas(
       const id = msg.obj.__id as string | undefined;
       if (!id) return;
 
+      // Checks both top-level objects AND group children. Group-child check
+      // is needed for the arrow double-broadcast: the raw path (uuid-A) is
+      // broadcast before the group swap, so uuid-A ends up as a child of the
+      // group (uuid-B). Without the child check, the path's delta:added would
+      // pass the guard and add a standalone duplicate. §7.3
+      function isPresent(searchId: string): boolean {
+        return cv.getObjects().some((o) => {
+          if ((o as any).__id === searchId) return true;
+          if (o instanceof fabric.Group) {
+            return (o as fabric.Group).getObjects().some(
+              (c) => (c as any).__id === searchId,
+            );
+          }
+          return false;
+        });
+      }
+
       // Sync idempotency guard before the async gap. §7.3
-      if (cv.getObjects().some((o) => (o as any).__id === id)) return;
+      if (isPresent(id)) return;
 
       fabric.util.enlivenObjects([msg.obj as Record<string, unknown>]).then((enlivened) => {
         const fabricObj = enlivened[0] as fabric.FabricObject | undefined;
-        if (!active || !fabricObj) return;
+        if (!active) return;
+        if (!fabricObj) return;
         // Re-check after async gap: a snapshot or prior delta may have
         // added this object while enlivenObjects was pending. §7.3 (R21)
-        if (cv.getObjects().some((o) => (o as any).__id === id)) return;
+        if (isPresent(id)) return;
 
         withRemote(() => {
+          // Arrow postprocess double-broadcast: the raw path is broadcast
+          // before the group swap. When the group arrives, any top-level
+          // object whose __id matches a group child is a stale raw-path
+          // duplicate — remove it so only the group remains. §7.3
+          if (fabricObj instanceof fabric.Group) {
+            for (const child of (fabricObj as fabric.Group).getObjects()) {
+              const childId = (child as any).__id as string | undefined;
+              if (!childId) continue;
+              const stale = cv.getObjects().find(
+                (o) => (o as any).__id === childId,
+              ) as fabric.FabricObject | undefined;
+              if (stale) cv.remove(stale);
+            }
+          }
           cv.add(fabricObj);
           cv.requestRenderAll();
         });

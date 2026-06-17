@@ -101,7 +101,12 @@ function initializeCanvas() {
   const canvas = new fabric.Canvas("canvas", {
     height: defaultSize.height,
     width: defaultSize.width,
-    isDrawingMode: true,
+    // Start false — useFreehand sets it true when pencil/arrow is active.
+    // Starting true here would leave the canvas in drawing mode for any
+    // non-drawing tool persisted in localStorage (e.g. marker), letting the
+    // brush capture strokes without a before:path:created handler registered,
+    // so those strokes would never get an __id and could not be broadcast.
+    isDrawingMode: false,
     perPixelTargetFind: true,
     selection: false,
     fireMiddleClick: true,
@@ -286,6 +291,13 @@ function App() {
   // roomStateRef (instead of subscribing to a snapshot InboundMessage which P2P
   // doesn't emit). React has committed the connected state before effects run, so
   // roomStateRef.current reflects the current peers at effect-fire time. §10.1
+  //
+  // Race fix: when two peers join simultaneously, both see each other in peers
+  // but neither has received the other's chip:claim yet, so claimedIds is empty
+  // for both. Deterministic rank-based assignment prevents collision: sort all
+  // peer IDs (self + remote), each peer picks the operator at its own rank index.
+  // Both peers compute the same sorted order, so they independently choose
+  // different operators without needing to see each other's claim first.
   useEffect(() => {
     if (roomStatus !== 'connected') return;
 
@@ -310,14 +322,23 @@ function App() {
     const claimedIds = new Set(
       Array.from(st.peers.values()).map((p) => p.operatorId).filter(Boolean),
     );
-    const unclaimed = operatorsRefP35.current.find((op) => !claimedIds.has(op.id));
-    if (unclaimed) {
-      setActiveOperatorId(unclaimed.id);
-      setJoinToastName(unclaimed.name);
-      // chip:claim is broadcast by the chip-change effect after the state
-      // update triggers a re-render (activeOperatorId null → unclaimed.id).
-    }
-  // roomStateRef is a stable ref — identity never changes, not a dep.
+    const unclaimedOps = operatorsRefP35.current.filter((op) => !claimedIds.has(op.id));
+    if (unclaimedOps.length === 0) return;
+
+    // Rank-based selection: include self in the sorted peer list so every peer
+    // sees the same total set and picks a unique slot by index. Peers that
+    // already claimed a chip are not in this branch (early-return above), so
+    // only "fresh" peers compete here. If there are more unclaimed peers than
+    // unclaimed operators, the last peers fall back to the first operator
+    // (harmless: they can always manually switch chips afterward).
+    const allPeerIds = [peerId, ...Array.from(st.peers.keys())].sort();
+    const myRank = allPeerIds.indexOf(peerId);
+    const toAssign = unclaimedOps[myRank] ?? unclaimedOps[0];
+    setActiveOperatorId(toAssign.id);
+    setJoinToastName(toAssign.name);
+    // chip:claim is broadcast by the chip-change effect after the state
+    // update triggers a re-render (activeOperatorId null → toAssign.id).
+  // roomStateRef and peerId are stable refs/values — identity never changes.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomStatus, roomBroadcast]);
 
@@ -334,6 +355,61 @@ function App() {
     if (prev !== null) roomBroadcast({ type: 'chip:release', operatorId: prev });
     if (activeOperatorId !== null) roomBroadcast({ type: 'chip:claim', operatorId: activeOperatorId });
   }, [activeOperatorId, roomStatus, roomBroadcast]);
+
+  // P3.5: conflict resolution — if a remote peer claims the same operator I
+  // hold, the peer with the LOWER peerId wins; I yield to the next unclaimed
+  // operator. Watches TWO message types for two distinct race shapes:
+  //
+  //   chip:claim — remote peer sends a fresh claim after both are connected.
+  //     Covers the localStorage-same-chip case where both re-claim the same
+  //     stored op on join.
+  //
+  //   peer:joined — remote peer's operatorId arrives via p2p:join handshake
+  //     when two peers first meet. This is the dominant path when BOTH hit the
+  //     12-second first-peer timer independently (each goes 'connected' with an
+  //     empty room, both claim Alpha, then meet). Their chip:claim broadcasts
+  //     had zero recipients at claim-time, so no chip:claim ever arrives — only
+  //     peer:joined carries the operatorId at meeting time.
+  //
+  // Lower peerId wins so both sides independently agree on who yields without
+  // needing an extra round-trip. §10.1
+  useEffect(() => {
+    const unsub = roomOnMessage((msg) => {
+      let conflictOp: string | null = null;
+      let fromPeer: string | null = null;
+
+      if (msg.type === 'chip:claim') {
+        conflictOp = msg.operatorId;
+        fromPeer = msg.peerId;
+      } else if (msg.type === 'peer:joined' && msg.operatorId) {
+        // p2p:join includes operatorId; dispatched as peer:joined by usePeerRoom.
+        conflictOp = msg.operatorId;
+        fromPeer = msg.peerId;
+      }
+
+      if (!conflictOp || !fromPeer) return;
+      const mine = activeOperatorIdRef.current;
+      // Only act when the incoming op conflicts with ours.
+      if (!mine || conflictOp !== mine) return;
+      // Lower peerId wins — if remote is higher than us, we keep our claim.
+      if (fromPeer >= peerId) return;
+      // We lose. Pick the next operator not yet taken by any peer (including
+      // the winner who just took `mine`).
+      const st = roomStateRef.current;
+      const takenIds = new Set([
+        mine,
+        ...(st?.status === 'connected'
+          ? Array.from(st.peers.values()).map((p) => p.operatorId).filter(Boolean)
+          : []),
+      ]);
+      const next = operatorsRefP35.current.find((op) => !takenIds.has(op.id));
+      setActiveOperatorId(next?.id ?? null);
+    });
+    return unsub;
+    // roomOnMessage is stable (useCallback []). activeOperatorIdRef, peerId,
+    // roomStateRef, operatorsRefP35 are stable refs/values. §10.1
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomOnMessage]);
 
   // Keep the URL query string in sync with roomId so the address bar always
   // holds a copyable link, and so a page reload re-joins the same room. §11.2
@@ -672,13 +748,11 @@ function App() {
       // Map image and other untagged objects have no __id; don't broadcast.
       const id = readId(target);
       if (!id) return;
-      roomBroadcast({
-        type: 'delta:added',
-        // toObject cast: EXTRAS contains custom __-prefixed props outside
-        // fabric's strict type — same pattern as tagObject in metadata.ts.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        obj: (target as any).toObject(EXTRAS),
-      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const serialized = (target as any).toObject(EXTRAS);
+      // toObject cast: EXTRAS contains custom __-prefixed props outside
+      // fabric's strict type — same pattern as tagObject in metadata.ts.
+      roomBroadcast({ type: 'delta:added', obj: serialized });
     };
 
     const onModified = ({ target }: { target: fabric.FabricObject }) => {
