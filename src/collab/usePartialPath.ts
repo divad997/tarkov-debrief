@@ -119,10 +119,15 @@ export function usePartialPath(
     // ghost and path:commit to the final delta:added. §8.2
     const activePathId = { current: null as string | null };
     let lastSend = 0;
+    // How many brush points were included in the last broadcast. Each frame we
+    // send only pts.slice(lastSentCount) so the receiver accumulates them
+    // rather than retransmitting the entire growing array. §8.2 bandwidth opt.
+    let lastSentCount = 0;
 
     const onMouseDown = () => {
       if (!cv.isDrawingMode) return;
       activePathId.current = crypto.randomUUID();
+      lastSentCount = 0;
     };
 
     const onMouseMove = () => {
@@ -131,7 +136,7 @@ export function usePartialPath(
       if (statusRef.current !== 'connected') return;
 
       const now = Date.now();
-      if (now - lastSend < 16) return; // ~60 fps cap
+      if (now - lastSend < 33) return; // ~30 fps cap (was 16 ms / 60 fps)
       lastSend = now;
 
       // _points is a protected field on PencilBrush (fabric v7 line 43 of
@@ -141,12 +146,23 @@ export function usePartialPath(
       const pts = (brush as any)._points as fabric.Point[] | undefined;
       if (!pts?.length) return;
 
+      // Delta-only: send only points added since the last frame. The receiver
+      // appends them to a per-stroke accumulator so the ghost always reflects
+      // the full stroke. Avoids re-transmitting the entire growing array.
+      const newPts = pts.slice(lastSentCount);
+      if (newPts.length === 0) return;
+      lastSentCount = pts.length;
+
       broadcastRef.current({
         type: 'path:stroke',
         id: activePathId.current,
         operatorId: operatorIdRef.current,
         phase: phaseRef.current,
-        points: pts.flatMap((p) => [p.x, p.y]),
+        // Round to 1 decimal — sub-pixel precision not needed for ghost rendering.
+        points: newPts.flatMap((p) => [
+          Math.round(p.x * 10) / 10,
+          Math.round(p.y * 10) / 10,
+        ]),
       });
     };
 
@@ -154,6 +170,7 @@ export function usePartialPath(
       const id = activePathId.current;
       if (!id) return;
       activePathId.current = null;
+      lastSentCount = 0;
       if (statusRef.current !== 'connected') return;
       // delta:added for the committed object is broadcast by the App.tsx
       // broadcast effect on the object:added event — no duplication needed.
@@ -169,16 +186,31 @@ export function usePartialPath(
     // Ghost path registry: strokeId → { ghost, opts }.
     // Opts are preserved so remove+re-add doesn't need to re-derive them.
     const ghostPaths = new Map<string, { ghost: fabric.Polyline; opts: GhostOpts }>();
+    // Accumulated points per stroke. The sender now broadcasts delta-only
+    // points each frame (only new points since the last send), so we must
+    // append them here to reconstruct the full stroke for each ghost update.
+    const strokePoints = new Map<string, fabric.Point[]>();
 
     const unsub = onRoomMessage((msg) => {
       if (!active) return;
 
       if (msg.type === 'path:stroke') {
-        const points: fabric.Point[] = [];
+        // msg.points is delta-only — deserialize and append to accumulator.
+        const newPts: fabric.Point[] = [];
         for (let i = 0; i + 1 < msg.points.length; i += 2) {
-          points.push(new fabric.Point(msg.points[i], msg.points[i + 1]));
+          newPts.push(new fabric.Point(msg.points[i], msg.points[i + 1]));
         }
-        if (points.length === 0) return;
+        if (newPts.length === 0) return;
+
+        const acc = strokePoints.get(msg.id);
+        let allPoints: fabric.Point[];
+        if (!acc) {
+          strokePoints.set(msg.id, newPts);
+          allPoints = newPts;
+        } else {
+          for (const p of newPts) acc.push(p);
+          allPoints = acc;
+        }
 
         const entry = ghostPaths.get(msg.id);
 
@@ -186,7 +218,7 @@ export function usePartialPath(
           // First frame for this stroke: create the ghost.
           const op = operatorsRef.current.find((o) => o.id === msg.operatorId);
           const opts = makeGhostOpts(op?.color ?? PENCIL_COLOR, msg.phase);
-          const ghost = createGhost(points, opts, msg.peerId, msg.id);
+          const ghost = createGhost(allPoints, opts, msg.peerId, msg.id);
           ghostPaths.set(msg.id, { ghost, opts });
           withRemote(() => {
             cv.add(ghost);
@@ -196,7 +228,7 @@ export function usePartialPath(
           // Subsequent frame: remove + re-add with updated points.
           // Plain set({ points }) leaves pathOffset stale and causes visual
           // drift as the path grows beyond its initial bounding box. §8.3 Check C
-          const newGhost = createGhost(points, entry.opts, msg.peerId, msg.id);
+          const newGhost = createGhost(allPoints, entry.opts, msg.peerId, msg.id);
           withRemote(() => {
             cv.remove(entry.ghost);
             cv.add(newGhost);
@@ -216,6 +248,7 @@ export function usePartialPath(
           });
           ghostPaths.delete(msg.id);
         }
+        strokePoints.delete(msg.id);
         // delta:added for the final path arrives shortly after via the
         // drawing peer's App.tsx broadcast effect. §8.3
         return;
@@ -229,6 +262,7 @@ export function usePartialPath(
             // no-ops. §8.4, design doc §0b correction.
             withRemote(() => cv.remove(ghost));
             ghostPaths.delete(id);
+            strokePoints.delete(id);
             changed = true;
           }
         }
@@ -248,6 +282,7 @@ export function usePartialPath(
         cv.remove(ghost);
       }
       ghostPaths.clear();
+      strokePoints.clear();
     };
   // broadcast is stable via useCallback; onRoomMessage is stable (empty deps).
   // Remaining deps are ref-mirrored so we never re-register the handlers.

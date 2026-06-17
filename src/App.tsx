@@ -504,6 +504,7 @@ function App() {
   // P3.3: broadcast local cursor position to peers at ~30 fps. Canvas coords
   // (pre-viewportTransform) so receivers can apply their own pan/zoom. §9.3
   const lastCursorSend = useRef(0);
+  const lastCursorPos = useRef({ x: -Infinity, y: -Infinity });
   useEffect(() => {
     const container = containerRef.current;
     if (!container || !maybeCanvas) return;
@@ -513,15 +514,20 @@ function App() {
       if (roomStatus !== 'connected') return;
       const now = Date.now();
       if (now - lastCursorSend.current < 33) return; // 30 fps cap
-      lastCursorSend.current = now;
       // Convert screen coordinates to canvas (scene) coordinates by inverting
-    // the current viewport transform. fabric v7 removed restorePointerVpt;
-    // invertTransform + transformPoint is the v7 equivalent. §9.3
-    const pt = fabric.util.transformPoint(
+      // the current viewport transform. fabric v7 removed restorePointerVpt;
+      // invertTransform + transformPoint is the v7 equivalent. §9.3
+      const pt = fabric.util.transformPoint(
         new fabric.Point(e.offsetX, e.offsetY),
         fabric.util.invertTransform(canvas.viewportTransform),
       );
-      roomBroadcast({ type: 'cursor', x: pt.x, y: pt.y });
+      // Dead-zone: skip if cursor hasn't moved enough to matter for ghost rendering.
+      const x = Math.round(pt.x * 10) / 10;
+      const y = Math.round(pt.y * 10) / 10;
+      if (Math.abs(x - lastCursorPos.current.x) < 2 && Math.abs(y - lastCursorPos.current.y) < 2) return;
+      lastCursorSend.current = now;
+      lastCursorPos.current = { x, y };
+      roomBroadcast({ type: 'cursor', x, y });
     };
 
     container.addEventListener('mousemove', onMouseMove);
